@@ -16,10 +16,12 @@ env:
   AZURE_CLIENT_ID: "00000000-0000-0000-0000-000000000000"
   AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000000"
   AZURE_SUBSCRIPTION_ID: "00000000-0000-0000-0000-000000000000"
+  ENABLE_PAM_REVOCATION: false
 
 jobs:
   revoke-expired-grants:
     runs-on: ubuntu-latest
+    if: ${{ vars.ENABLE_PAM_REVOCATION == 'true' }}
     steps:
       - name: Configure AWS Credentials (for S3)
         uses: aws-actions/configure-aws-credentials@v4

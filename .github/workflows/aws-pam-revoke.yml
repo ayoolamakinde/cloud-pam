@@ -13,10 +13,12 @@ env:
   AWS_REGION: us-east-1
   GRANTS_BUCKET: cloud-pam-grants
   AWS_TERRAFORM_ROLE_ARN: "arn:aws:iam::000000000000:role/cloud-pam-terraform-role"
+  ENABLE_PAM_REVOCATION: false
 
 jobs:
   revoke-expired-grants:
     runs-on: ubuntu-latest
+    if: ${{ vars.ENABLE_PAM_REVOCATION == 'true' }}
     steps:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4

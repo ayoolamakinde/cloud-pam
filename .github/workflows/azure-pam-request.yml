@@ -1,0 +1,213 @@
+name: Azure PAM - Access Request
+
+on:
+  workflow_dispatch:
+    inputs:
+      role_name:
+        description: 'Select Azure RBAC Role'
+        required: true
+        type: choice
+        options:
+          - Owner
+          - Contributor
+          - Reader
+          - Security Reader
+          - Security Admin
+          - User Access Administrator
+      subscription_name:
+        description: 'Azure Subscription Name'
+        required: true
+        type: string
+      duration:
+        description: 'Access Duration'
+        required: true
+        type: choice
+        options:
+          - 30mins
+          - 1hr
+          - 2hrs
+          - 4hrs
+          - 1day
+      justification:
+        description: 'Justification (ticket / task)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  AWS_REGION: us-east-1
+  GRANTS_BUCKET: cloud-pam-grants
+  AWS_TERRAFORM_ROLE_ARN: "arn:aws:iam::000000000000:role/cloud-pam-terraform-role"
+  AZURE_CLIENT_ID: "00000000-0000-0000-0000-000000000000"  # Update with your Azure app client ID
+  AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000000"  # Update with your tenant ID
+  AZURE_SUBSCRIPTION_ID: "00000000-0000-0000-0000-000000000000"  # Update with subscription ID for auth
+
+jobs:
+  validate-and-prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      subscription_id: ${{ steps.validate.outputs.subscription_id }}
+    steps:
+      - name: Configure Azure Credentials
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch Subscriptions
+        id: fetch
+        run: |
+          az account list \
+            --query "[?state=='Enabled'].{name:name,id:id}" \
+            -o json > subs.json
+
+          echo "Found subscriptions:"
+          jq -r '.[].name' subs.json
+
+      - name: Validate Subscription Name
+        id: validate
+        run: |
+          SUB_NAME="${{ github.event.inputs.subscription_name }}"
+          SUB_ID=$(jq -r --arg name "$SUB_NAME" '.[] | select(.name==$name) | .id' subs.json)
+
+          if [ -z "$SUB_ID" ]; then
+            echo "❌ Subscription not found: $SUB_NAME"
+            exit 1
+          fi
+
+          echo "✅ Subscription validated: $SUB_NAME ($SUB_ID)"
+          echo "subscription_id=$SUB_ID" >> $GITHUB_OUTPUT
+
+  request-approval:
+    runs-on: ubuntu-latest
+    needs: validate-and-prepare
+    outputs:
+      requester_email: ${{ steps.get-user.outputs.email }}
+    steps:
+      - name: Get Requester Email
+        id: get-user
+        run: |
+          USER_EMAIL=$(gh api /user --jq '.email')
+
+          if [ -z "$USER_EMAIL" ]; then
+            echo "❌ Unable to retrieve email for user ${{ github.actor }}"
+            exit 1
+          fi
+
+          echo "email=$USER_EMAIL" >> $GITHUB_OUTPUT
+          echo "✅ Requester: ${{ github.actor }} - $USER_EMAIL"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Approval Issue
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 60
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ vars.PAM_APPROVER_TEAM }}
+          minimum-approvals: 1
+          issue-title: "Azure PAM Access Request: ${{ github.event.inputs.role_name }} for ${{ github.event.inputs.subscription_name }}"
+          issue-body: |
+            ## Azure PAM Access Request Details
+
+            **Requester:** @${{ github.actor }}
+            **Email:** ${{ steps.get-user.outputs.email }}
+            **Role:** `${{ github.event.inputs.role_name }}`
+            **Subscription:** `${{ github.event.inputs.subscription_name }}`
+            **Duration:** `${{ github.event.inputs.duration }}`
+            **Request Time:** ${{ github.event.repository.updated_at }}
+
+            ### Justification
+            ${{ github.event.inputs.justification }}
+
+            ---
+
+            **To approve this request, comment `approve` on this issue.**
+            **To deny this request, comment `deny` on this issue.**
+
+            ⚠️ **Note:** This approval will timeout after 60 minutes.
+          exclude-workflow-initiator-as-approver: false
+
+  grant-access:
+    runs-on: ubuntu-latest
+    needs: [validate-and-prepare, request-approval]
+    steps:
+      - name: Configure AWS Credentials (for S3)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure Azure Credentials
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get User Object ID
+        id: user
+        run: |
+          USER_ID=$(az ad user show \
+            --id "${{ needs.request-approval.outputs.requester_email }}" \
+            --query id -o tsv)
+
+          if [ -z "$USER_ID" ]; then
+            echo "❌ User not found: ${{ needs.request-approval.outputs.requester_email }}"
+            exit 1
+          fi
+
+          echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+
+      - name: Assign RBAC Role
+        id: assign
+        run: |
+          az role assignment create \
+            --assignee "${{ steps.user.outputs.user_id }}" \
+            --role "${{ github.event.inputs.role_name }}" \
+            --scope "/subscriptions/${{ needs.validate-and-prepare.outputs.subscription_id }}"
+
+          echo "✅ Role assigned"
+
+      - name: Store Grant Details
+        id: store-grant
+        run: |
+          case "${{ github.event.inputs.duration }}" in
+            "30mins") EXPIRY_MINUTES=30 ;;
+            "1hr") EXPIRY_MINUTES=60 ;;
+            "2hrs") EXPIRY_MINUTES=120 ;;
+            "4hrs") EXPIRY_MINUTES=240 ;;
+            "1day") EXPIRY_MINUTES=$((1*24*60)) ;;
+          esac
+
+          EXPIRY_TIMESTAMP=$(date -u -d "+${EXPIRY_MINUTES} minutes" +%s)
+          EXPIRY_DATETIME=$(date -u -d "+${EXPIRY_MINUTES} minutes" +"%Y-%m-%dT%H:%M:%SZ")
+
+          GRANT_ID="${{ github.run_id }}-${{ github.run_number }}"
+
+          cat > grant.json << EOF
+          {
+            "grantId": "${GRANT_ID}",
+            "cloudProvider": "azure",
+            "userObjectId": "${{ steps.user.outputs.user_id }}",
+            "userEmail": "${{ needs.request-approval.outputs.requester_email }}",
+            "role": "${{ github.event.inputs.role_name }}",
+            "subscription": "${{ github.event.inputs.subscription_name }}",
+            "subscriptionId": "${{ needs.validate-and-prepare.outputs.subscription_id }}",
+            "duration": "${{ github.event.inputs.duration }}",
+            "grantedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "expiresAt": "${EXPIRY_DATETIME}",
+            "expiresAtTimestamp": ${EXPIRY_TIMESTAMP},
+            "justification": "${{ github.event.inputs.justification }}",
+            "workflowRunId": "${{ github.run_id }}"
+          }
+          EOF
+
+          aws s3 cp grant.json s3://${{ env.GRANTS_BUCKET }}/azure-grants/${GRANT_ID}.json
+
+          echo "✅ Grant stored - expires at: $EXPIRY_DATETIME"

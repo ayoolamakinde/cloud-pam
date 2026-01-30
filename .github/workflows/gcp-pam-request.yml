@@ -1,0 +1,204 @@
+name: GCP PAM - Access Request
+
+# Note: GCP has built-in Privileged Access Manager (PAM) that can be used directly
+# from the Cloud Console. This workflow provides a consistent interface across all
+# cloud providers (AWS, Azure, GCP) for requesting temporary privileged access.
+
+on:
+  workflow_dispatch:
+    inputs:
+      role_name:
+        description: 'Select GCP IAM Role'
+        required: true
+        type: choice
+        options:
+          - roles/owner
+          - roles/editor
+          - roles/viewer
+          - roles/compute.admin
+          - roles/storage.admin
+          - roles/container.admin
+          - roles/iam.securityAdmin
+      project_id:
+        description: 'GCP Project ID'
+        required: true
+        type: string
+      duration:
+        description: 'Access Duration (GCP PAM handles auto-revocation)'
+        required: true
+        type: choice
+        options:
+          - 30mins
+          - 1hr
+          - 2hrs
+          - 3hrs
+          - 4hrs
+      justification:
+        description: 'Justification for access (e.g., Ticket number, task description)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  GRANTS_BUCKET: cloud-pam-grants
+  AWS_TERRAFORM_ROLE_ARN: "arn:aws:iam::000000000000:role/cloud-pam-terraform-role"
+  GCP_WORKLOAD_IDENTITY_PROVIDER: "projects/000000000000/locations/global/workloadIdentityPools/github-pool/providers/github-provider"  # Update
+  GCP_SERVICE_ACCOUNT: "cloud-pam@your-project.iam.gserviceaccount.com"  # Update
+
+jobs:
+  validate-and-prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      project_valid: ${{ steps.validate.outputs.project_valid }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Validate Project ID
+        id: validate
+        run: |
+          echo "🔍 Validating GCP project..."
+
+          if gcloud projects describe "${{ github.event.inputs.project_id }}" --format="value(projectId)" &>/dev/null; then
+            echo "✅ Project '${{ github.event.inputs.project_id }}' is valid"
+            echo "project_valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Project '${{ github.event.inputs.project_id }}' not found or not accessible"
+            echo "project_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  request-approval:
+    runs-on: ubuntu-latest
+    needs: validate-and-prepare
+    outputs:
+      requester_email: ${{ steps.get-user.outputs.email }}
+    steps:
+      - name: Get Requester Email
+        id: get-user
+        run: |
+          USER_EMAIL=$(gh api /user --jq '.email')
+
+          if [ -z "$USER_EMAIL" ]; then
+            echo "❌ Unable to retrieve email for user ${{ github.actor }}"
+            exit 1
+          fi
+
+          echo "email=$USER_EMAIL" >> $GITHUB_OUTPUT
+          echo "✅ Requester: ${{ github.actor }} - $USER_EMAIL"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Approval Issue
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 60
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ vars.PAM_APPROVER_TEAM }}
+          minimum-approvals: 1
+          issue-title: "GCP PAM Access Request: ${{ github.event.inputs.role_name }} for ${{ github.event.inputs.project_id }}"
+          issue-body: |
+            ## GCP PAM Access Request Details
+
+            **Requester:** @${{ github.actor }}
+            **Email:** ${{ steps.get-user.outputs.email }}
+            **Role:** `${{ github.event.inputs.role_name }}`
+            **Project ID:** `${{ github.event.inputs.project_id }}`
+            **Duration:** `${{ github.event.inputs.duration }}`
+            **Request Time:** ${{ github.event.repository.updated_at }}
+
+            ### Justification
+            ${{ github.event.inputs.justification }}
+
+            ---
+
+            **To approve this request, comment `approve` on this issue.**
+            **To deny this request, comment `deny` on this issue.**
+
+            ⚠️ **Note:** This approval will timeout after 60 minutes.
+          exclude-workflow-initiator-as-approver: false
+
+  grant-access:
+    runs-on: ubuntu-latest
+    needs: [validate-and-prepare, request-approval]
+    steps:
+      - name: Configure AWS Credentials (for S3)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Grant IAM Role with Time-based Condition
+        id: grant
+        run: |
+          echo "Granting ${{ github.event.inputs.role_name }} to ${{ needs.request-approval.outputs.requester_email }}"
+
+          # Convert duration to hours for GCP condition
+          case "${{ github.event.inputs.duration }}" in
+            "30mins") HOURS=0.5 ;;
+            "1hr") HOURS=1 ;;
+            "2hrs") HOURS=2 ;;
+            "3hrs") HOURS=3 ;;
+            "4hrs") HOURS=4 ;;
+          esac
+
+          # Calculate expiration time
+          EXPIRY_TIME=$(date -u -d "+${HOURS} hours" +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Create time-based condition for automatic revocation
+          # GCP IAM conditions automatically enforce time-based access
+          gcloud projects add-iam-policy-binding "${{ github.event.inputs.project_id }}" \
+            --member="user:${{ needs.request-approval.outputs.requester_email }}" \
+            --role="${{ github.event.inputs.role_name }}" \
+            --condition="expression=request.time < timestamp('${EXPIRY_TIME}'),title=PAM-Grant-${{ github.run_id }},description=Temporary access expires at ${EXPIRY_TIME}"
+
+          echo "✅ IAM role granted with automatic expiration at ${EXPIRY_TIME}"
+          echo "expiry_time=${EXPIRY_TIME}" >> $GITHUB_OUTPUT
+
+      - name: Store Grant Details (Audit Trail)
+        id: store-grant
+        run: |
+          # Store for audit purposes only - GCP handles auto-revocation via IAM conditions
+          GRANT_ID="${{ github.run_id }}-${{ github.run_number }}"
+          EXPIRY_TIME="${{ steps.grant.outputs.expiry_time }}"
+
+          cat > grant.json << EOF
+          {
+            "grantId": "${GRANT_ID}",
+            "cloudProvider": "gcp",
+            "userEmail": "${{ needs.request-approval.outputs.requester_email }}",
+            "role": "${{ github.event.inputs.role_name }}",
+            "projectId": "${{ github.event.inputs.project_id }}",
+            "duration": "${{ github.event.inputs.duration }}",
+            "grantedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "expiresAt": "${EXPIRY_TIME}",
+            "justification": "${{ github.event.inputs.justification }}",
+            "workflowRunId": "${{ github.run_id }}",
+            "autoRevoke": "GCP IAM Conditions",
+            "note": "Auto-revocation handled by GCP's native IAM conditional bindings"
+          }
+          EOF
+
+          aws s3 cp grant.json s3://${{ env.GRANTS_BUCKET }}/gcp-grants/${GRANT_ID}.json
+
+          echo "✅ Grant audit record stored - GCP will auto-revoke at: $EXPIRY_TIME"

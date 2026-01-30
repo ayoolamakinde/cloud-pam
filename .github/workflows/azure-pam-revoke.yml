@@ -1,0 +1,115 @@
+name: Azure PAM - Auto-Revoke
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # Run every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  GRANTS_BUCKET: cloud-pam-grants
+  AWS_TERRAFORM_ROLE_ARN: "arn:aws:iam::000000000000:role/cloud-pam-terraform-role"
+  AZURE_CLIENT_ID: "00000000-0000-0000-0000-000000000000"
+  AZURE_TENANT_ID: "00000000-0000-0000-0000-000000000000"
+  AZURE_SUBSCRIPTION_ID: "00000000-0000-0000-0000-000000000000"
+
+jobs:
+  revoke-expired-grants:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials (for S3)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure Azure Credentials
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Check for Expired Grants
+        id: check-grants
+        run: |
+          echo "🔍 Checking for expired Azure PAM grants..."
+          CURRENT_TIME=$(date -u +%s)
+
+          GRANT_FILES=$(aws s3 ls s3://${{ env.GRANTS_BUCKET }}/azure-grants/ --recursive | awk '{print $4}' || echo "")
+
+          if [ -z "$GRANT_FILES" ]; then
+            echo "ℹ️ No active grants found"
+            echo "has_expired_grants=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          EXPIRED_GRANTS=()
+
+          for GRANT_FILE in $GRANT_FILES; do
+            echo "Checking $GRANT_FILE"
+            aws s3 cp s3://${{ env.GRANTS_BUCKET }}/$GRANT_FILE grant.json
+
+            EXPIRY_TIMESTAMP=$(jq -r '.expiresAtTimestamp' grant.json)
+            GRANT_ID=$(jq -r '.grantId' grant.json)
+
+            if [ "$CURRENT_TIME" -ge "$EXPIRY_TIMESTAMP" ]; then
+              echo "⏰ Grant $GRANT_ID expired"
+              EXPIRED_GRANTS+=("$GRANT_FILE")
+            fi
+
+            rm -f grant.json
+          done
+
+          if [ ${#EXPIRED_GRANTS[@]} -eq 0 ]; then
+            echo "ℹ️ No expired grants found"
+            echo "has_expired_grants=false" >> $GITHUB_OUTPUT
+          else
+            echo "📝 Found ${#EXPIRED_GRANTS[@]} expired grant(s)"
+            printf '%s\n' "${EXPIRED_GRANTS[@]}" > expired_grants.txt
+            echo "has_expired_grants=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Revoke Expired Grants
+        if: steps.check-grants.outputs.has_expired_grants == 'true'
+        run: |
+          echo "🔐 Revoking expired Azure grants..."
+          REVOKED_COUNT=0
+          FAILED_COUNT=0
+
+          while IFS= read -r GRANT_FILE; do
+            aws s3 cp s3://${{ env.GRANTS_BUCKET }}/$GRANT_FILE grant.json
+
+            GRANT_ID=$(jq -r '.grantId' grant.json)
+            USER_EMAIL=$(jq -r '.userEmail' grant.json)
+            ROLE=$(jq -r '.role' grant.json)
+            SUBSCRIPTION_ID=$(jq -r '.subscriptionId' grant.json)
+
+            echo "Revoking $ROLE from $USER_EMAIL on subscription $SUBSCRIPTION_ID"
+
+            ASSIGNMENT_ID=$(az role assignment list \
+              --assignee "$USER_EMAIL" \
+              --role "$ROLE" \
+              --scope "/subscriptions/$SUBSCRIPTION_ID" \
+              --query "[0].id" -o tsv)
+
+            if [ -z "$ASSIGNMENT_ID" ]; then
+              echo "⚠️ Assignment not found - already revoked or never existed"
+              aws s3 rm s3://${{ env.GRANTS_BUCKET }}/$GRANT_FILE
+            elif az role assignment delete --ids "$ASSIGNMENT_ID" 2>&1; then
+              echo "✅ Successfully revoked grant $GRANT_ID"
+              aws s3 rm s3://${{ env.GRANTS_BUCKET }}/$GRANT_FILE
+              REVOKED_COUNT=$((REVOKED_COUNT + 1))
+            else
+              echo "❌ Failed to revoke grant $GRANT_ID"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+
+            rm -f grant.json
+          done < expired_grants.txt
+
+          echo "✅ Revocation complete: $REVOKED_COUNT revoked, $FAILED_COUNT failed"

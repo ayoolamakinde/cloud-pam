@@ -1,0 +1,108 @@
+name: AWS PAM - Auto-Revoke
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Run every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  GRANTS_BUCKET: cloud-pam-grants
+  AWS_TERRAFORM_ROLE_ARN: "arn:aws:iam::000000000000:role/cloud-pam-terraform-role"
+
+jobs:
+  revoke-expired-grants:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check for Expired Grants
+        id: check-grants
+        run: |
+          echo "🔍 Checking for expired AWS PAM grants..."
+          CURRENT_TIME=$(date -u +%s)
+
+          GRANT_FILES=$(aws s3 ls s3://${{ env.GRANTS_BUCKET }}/aws-grants/ --recursive | awk '{print $4}' || echo "")
+
+          if [ -z "$GRANT_FILES" ]; then
+            echo "ℹ️ No active grants found"
+            echo "has_expired_grants=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          EXPIRED_GRANTS=()
+
+          for GRANT_FILE in $GRANT_FILES; do
+            echo "Checking $GRANT_FILE"
+            aws s3 cp s3://${{ env.GRANTS_BUCKET }}/$GRANT_FILE grant.json
+
+            EXPIRY_TIMESTAMP=$(jq -r '.expiresAtTimestamp' grant.json)
+            GRANT_ID=$(jq -r '.grantId' grant.json)
+
+            if [ "$CURRENT_TIME" -ge "$EXPIRY_TIMESTAMP" ]; then
+              echo "⏰ Grant $GRANT_ID expired"
+              EXPIRED_GRANTS+=("$GRANT_FILE")
+            else
+              TIME_LEFT=$((EXPIRY_TIMESTAMP - CURRENT_TIME))
+              MINUTES_LEFT=$((TIME_LEFT / 60))
+              echo "✅ Grant $GRANT_ID active (expires in ${MINUTES_LEFT} minutes)"
+            fi
+
+            rm -f grant.json
+          done
+
+          if [ ${#EXPIRED_GRANTS[@]} -eq 0 ]; then
+            echo "ℹ️ No expired grants found"
+            echo "has_expired_grants=false" >> $GITHUB_OUTPUT
+          else
+            echo "📝 Found ${#EXPIRED_GRANTS[@]} expired grant(s)"
+            printf '%s\n' "${EXPIRED_GRANTS[@]}" > expired_grants.txt
+            echo "has_expired_grants=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Revoke Expired Grants
+        if: steps.check-grants.outputs.has_expired_grants == 'true'
+        run: |
+          echo "🔐 Revoking expired grants..."
+          REVOKED_COUNT=0
+          FAILED_COUNT=0
+
+          while IFS= read -r GRANT_FILE; do
+            aws s3 cp s3://${{ env.GRANTS_BUCKET }}/$GRANT_FILE grant.json
+
+            GRANT_ID=$(jq -r '.grantId' grant.json)
+            USER_ID=$(jq -r '.userId' grant.json)
+            PERMISSION_SET_ARN=$(jq -r '.permissionSetArn' grant.json)
+            ACCOUNT_ID=$(jq -r '.accountId' grant.json)
+            INSTANCE_ARN=$(jq -r '.instanceArn' grant.json)
+
+            echo "Revoking grant $GRANT_ID..."
+
+            if aws sso-admin delete-account-assignment \
+              --instance-arn "$INSTANCE_ARN" \
+              --target-id "$ACCOUNT_ID" \
+              --target-type AWS_ACCOUNT \
+              --permission-set-arn "$PERMISSION_SET_ARN" \
+              --principal-type USER \
+              --principal-id "$USER_ID" 2>&1; then
+
+              echo "✅ Successfully revoked grant $GRANT_ID"
+              aws s3 rm s3://${{ env.GRANTS_BUCKET }}/$GRANT_FILE
+              REVOKED_COUNT=$((REVOKED_COUNT + 1))
+            else
+              echo "❌ Failed to revoke grant $GRANT_ID"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+
+            rm -f grant.json
+          done < expired_grants.txt
+
+          echo "✅ Revocation complete: $REVOKED_COUNT revoked, $FAILED_COUNT failed"

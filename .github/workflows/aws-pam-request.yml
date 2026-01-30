@@ -1,0 +1,269 @@
+name: AWS PAM - Access Request
+
+on:
+  workflow_dispatch:
+    inputs:
+      permission_set:
+        description: 'Select AWS Permission Set'
+        required: true
+        type: choice
+        options:
+          - PAM-AWS-AdministratorAccess
+          - PAM-AWS-EKSAdmin
+          - PAM-AWS-S3FullAccess
+          - PAM-AWS-SecurityAudit
+          - PAM-AWS-ReadOnlyAccess
+      account_name:
+        description: 'Enter AWS Account Name'
+        required: true
+        type: string
+      duration:
+        description: 'Access Duration'
+        required: true
+        type: choice
+        options:
+          - 30mins
+          - 1hr
+          - 2hrs
+          - 3hrs
+          - 4hrs
+      justification:
+        description: 'Justification for access (e.g., Ticket number, task description)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  issues: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  GRANTS_BUCKET: cloud-pam-grants  # Update with your S3 bucket name
+  AWS_MANAGEMENT_ACCOUNT_ID: "000000000000"  # Update with your management account ID
+  AWS_TERRAFORM_ROLE_ARN: "arn:aws:iam::000000000000:role/cloud-pam-terraform-role"  # Update with your role ARN
+
+jobs:
+  validate-and-prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      all_accounts: ${{ steps.fetch-accounts.outputs.accounts }}
+      account_valid: ${{ steps.validate.outputs.account_valid }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch AWS Accounts
+        id: fetch-accounts
+        run: |
+          echo "🔍 Fetching AWS accounts from Organizations..."
+
+          ACCOUNTS=$(aws organizations list-accounts \
+            --query "Accounts[?Status=='ACTIVE'].Name" \
+            --output json | jq -c .)
+
+          echo "accounts=$ACCOUNTS" >> $GITHUB_OUTPUT
+          echo "✅ Found Active Accounts:"
+          echo "$ACCOUNTS" | jq -r '.[]' | head -20
+
+      - name: Validate Account Name
+        id: validate
+        run: |
+          echo "🔍 Validating AWS account name..."
+
+          ACCOUNTS='${{ steps.fetch-accounts.outputs.accounts }}'
+          REQUESTED_ACCOUNT="${{ github.event.inputs.account_name }}"
+
+          if echo "$ACCOUNTS" | jq -e --arg acc "$REQUESTED_ACCOUNT" 'contains([$acc])' > /dev/null; then
+            echo "✅ Account '$REQUESTED_ACCOUNT' is valid"
+            echo "account_valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Account '$REQUESTED_ACCOUNT' not found in AWS Organizations"
+            echo "account_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  request-approval:
+    runs-on: ubuntu-latest
+    needs: validate-and-prepare
+    outputs:
+      requester_email: ${{ steps.get-user.outputs.email }}
+    steps:
+      - name: Get Requester Email
+        id: get-user
+        run: |
+          USER_EMAIL=$(gh api /user --jq '.email')
+
+          if [ -z "$USER_EMAIL" ]; then
+            echo "❌ Unable to retrieve email for user ${{ github.actor }}"
+            exit 1
+          fi
+
+          echo "email=$USER_EMAIL" >> $GITHUB_OUTPUT
+          echo "✅ Requester: ${{ github.actor }} - $USER_EMAIL"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Approval Issue
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 60
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ vars.PAM_APPROVER_TEAM }}
+          minimum-approvals: 1
+          issue-title: "AWS PAM Access Request: ${{ github.event.inputs.permission_set }} for ${{ github.event.inputs.account_name }}"
+          issue-body: |
+            ## AWS PAM Access Request Details
+
+            **Requester:** @${{ github.actor }}
+            **Email:** ${{ steps.get-user.outputs.email }}
+            **Permission Set:** `${{ github.event.inputs.permission_set }}`
+            **AWS Account:** `${{ github.event.inputs.account_name }}`
+            **Duration:** `${{ github.event.inputs.duration }}`
+            **Request Time:** ${{ github.event.repository.updated_at }}
+
+            ### Justification
+            ${{ github.event.inputs.justification }}
+
+            ---
+
+            **To approve this request, comment `approve` on this issue.**
+            **To deny this request, comment `deny` on this issue.**
+
+            ⚠️ **Note:** This approval will timeout after 60 minutes.
+          exclude-workflow-initiator-as-approver: false
+
+  grant-access:
+    runs-on: ubuntu-latest
+    needs: [validate-and-prepare, request-approval]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Account ID
+        id: get-account
+        run: |
+          ACCOUNT_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='${{ github.event.inputs.account_name }}'].Id" \
+            --output text)
+
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "❌ Account not found: ${{ github.event.inputs.account_name }}"
+            exit 1
+          fi
+
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "✅ Found Account ID: $ACCOUNT_ID"
+
+      - name: Get Identity Store Details
+        id: get-ids
+        run: |
+          INSTANCE_ARN=$(aws sso-admin list-instances \
+            --query "Instances[0].InstanceArn" \
+            --output text)
+
+          IDENTITY_STORE_ID=$(aws sso-admin list-instances \
+            --query "Instances[0].IdentityStoreId" \
+            --output text)
+
+          # Find permission set ARN
+          for ps_arn in $(aws sso-admin list-permission-sets \
+            --instance-arn "$INSTANCE_ARN" \
+            --query "PermissionSets[]" \
+            --output text); do
+
+              PS_NAME=$(aws sso-admin describe-permission-set \
+                --instance-arn "$INSTANCE_ARN" \
+                --permission-set-arn "$ps_arn" \
+                --query "PermissionSet.Name" \
+                --output text 2>&1)
+
+              if [ "$PS_NAME" = "${{ github.event.inputs.permission_set }}" ]; then
+                PERMISSION_SET_ARN="$ps_arn"
+                break
+              fi
+          done
+
+          if [ -z "$PERMISSION_SET_ARN" ]; then
+            echo "❌ Permission Set not found: ${{ github.event.inputs.permission_set }}"
+            exit 1
+          fi
+
+          echo "instance_arn=$INSTANCE_ARN" >> $GITHUB_OUTPUT
+          echo "identity_store_id=$IDENTITY_STORE_ID" >> $GITHUB_OUTPUT
+          echo "permission_set_arn=$PERMISSION_SET_ARN" >> $GITHUB_OUTPUT
+
+      - name: Get User ID
+        id: get-user-id
+        run: |
+          USER_ID=$(aws identitystore list-users \
+            --identity-store-id "${{ steps.get-ids.outputs.identity_store_id }}" \
+            --filters AttributePath=UserName,AttributeValue="${{ needs.request-approval.outputs.requester_email }}" \
+            --query "Users[0].UserId" \
+            --output text)
+
+          if [ -z "$USER_ID" ] || [ "$USER_ID" = "None" ]; then
+            echo "❌ User not found: ${{ needs.request-approval.outputs.requester_email }}"
+            exit 1
+          fi
+
+          echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Account Assignment
+        id: assign-permission
+        run: |
+          aws sso-admin create-account-assignment \
+            --instance-arn "${{ steps.get-ids.outputs.instance_arn }}" \
+            --target-id "${{ steps.get-account.outputs.account_id }}" \
+            --target-type AWS_ACCOUNT \
+            --permission-set-arn "${{ steps.get-ids.outputs.permission_set_arn }}" \
+            --principal-type USER \
+            --principal-id "${{ steps.get-user-id.outputs.user_id }}"
+
+          echo "✅ Account assignment created"
+
+      - name: Store Grant Details
+        id: store-grant
+        run: |
+          case "${{ github.event.inputs.duration }}" in
+            "30mins") EXPIRY_MINUTES=30 ;;
+            "1hr") EXPIRY_MINUTES=60 ;;
+            "2hrs") EXPIRY_MINUTES=120 ;;
+            "3hrs") EXPIRY_MINUTES=180 ;;
+            "4hrs") EXPIRY_MINUTES=240 ;;
+          esac
+
+          EXPIRY_TIMESTAMP=$(date -u -d "+${EXPIRY_MINUTES} minutes" +%s)
+          EXPIRY_DATETIME=$(date -u -d "+${EXPIRY_MINUTES} minutes" +"%Y-%m-%dT%H:%M:%SZ")
+
+          GRANT_ID="${{ github.run_id }}-${{ github.run_number }}"
+
+          cat > grant.json << EOF
+          {
+            "grantId": "${GRANT_ID}",
+            "cloudProvider": "aws",
+            "userId": "${{ steps.get-user-id.outputs.user_id }}",
+            "userEmail": "${{ needs.request-approval.outputs.requester_email }}",
+            "permissionSetArn": "${{ steps.get-ids.outputs.permission_set_arn }}",
+            "permissionSetName": "${{ github.event.inputs.permission_set }}",
+            "accountId": "${{ steps.get-account.outputs.account_id }}",
+            "accountName": "${{ github.event.inputs.account_name }}",
+            "instanceArn": "${{ steps.get-ids.outputs.instance_arn }}",
+            "duration": "${{ github.event.inputs.duration }}",
+            "grantedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "expiresAt": "${EXPIRY_DATETIME}",
+            "expiresAtTimestamp": ${EXPIRY_TIMESTAMP},
+            "justification": "${{ github.event.inputs.justification }}",
+            "workflowRunId": "${{ github.run_id }}"
+          }
+          EOF
+
+          aws s3 cp grant.json s3://${{ env.GRANTS_BUCKET }}/aws-grants/${GRANT_ID}.json
+
+          echo "✅ Grant stored - expires at: $EXPIRY_DATETIME"
